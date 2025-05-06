@@ -69,13 +69,16 @@ class Client:
         assert set(dict_) >= {'name','profiles'}
         self.__dict__.update(dict_)
 
+    @property
+    def is_connected(self):
+        netvm = qubes.query_property(self.name, "netvm")
+        return netvm == qubes.app.local_name
+
     @cached_property
     def addr(self):
-        get_ip_call = "admin.vm.property.Get+visible_ip"
-        *x, addr = qubes.query(self.name, get_ip_call).split(maxsplit=2)
-        if len(x) != 2 or not is_ip4(addr):
-            msg = f"Can't make sense of result querying {self.name} {get_ip_call}"
-            raise ValueError(msg, query_result)
+        addr = qubes.query_property(self.name, "ip")
+        if not is_ip4(addr):
+            raise ValueError()
         return addr
 
     @property
@@ -118,6 +121,8 @@ def load_clients_config(filepath):
                 raise ValueError(msg)
 
             cli = Client(name=client_name, profiles=profiles)
+            if not cli.is_connected:
+                print(f"Warning: {cli.name} is not connected", file=sys.stderr)
             conf.append(cli)
     return conf
 

@@ -58,16 +58,39 @@ class qubes:
     def app(self):
         return self.admin.Qubes()
 
-    def query(self, client_name, api_call):
+    def query(self, qube_name, api_call):
         try:
-            query_result = self.app.qubesd_call(client_name, api_call)
+            query_result = self.app.qubesd_call(qube_name, api_call)
         except self.admin.exc.QubesDaemonAccessError:
-            msg = f"Forbidden access querying {client_name}. You may have " \
+            msg = f"Forbidden access querying {qube_name}. You may have " \
                 + "forgotten to add the relevant tag (using qvm-tags), or " \
-                + f"maybe {client_name} doesn't exist."
+                + f"maybe {qube_name} doesn't exist."
             print(msg, file=sys.stderr)
             raise
         return query_result.decode()
+
+    def query_property(self, qube_name, prop):
+        get_prop_call = "admin.vm.property.Get+"+prop
+        query_result = self.query(qube_name, get_prop_call).decode()
+        try:
+            x = query_result.split(maxsplit=2)
+            typeliteral , _, type_ = x[1].partition('=')
+            if typeliteral != "type":
+                raise ValueError()
+            value_str = x[2].strip()
+        except:
+            msg = f"Can't make sense of result querying {qube_name} {get_prop_call}"
+            raise ValueError(msg, query_result)
+
+        match type_:
+            case "str" | "vm" | "label":
+                return value_str
+            case "int":
+                return int(value_str)
+            case "bool":
+                return {"False":False, "True":True}[value_str]
+            case _:
+                raise TypeError(f"property type {type_} not supported here.")
 
     @staticmethod
     def dns_addrs():
