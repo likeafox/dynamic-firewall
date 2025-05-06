@@ -1,0 +1,4 @@
+admin.vm.CurrentState  * dynamic-firewall  @tag:dynamic-firewall-user  allow target=@adminvm
+admin.vm.property.List * dynamic-firewall  @tag:dynamic-firewall-user  allow target=@adminvm
+admin.vm.property.Get  * dynamic-firewall  @tag:dynamic-firewall-user  allow target=@adminvm
+admin.vm.firewall.Get  * dynamic-firewall  @tag:dynamic-firewall-user  allow target=@adminvm
