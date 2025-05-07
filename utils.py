@@ -71,7 +71,7 @@ class qubes:
 
     def query_property(self, qube_name, prop):
         get_prop_call = "admin.vm.property.Get+"+prop
-        query_result = self.query(qube_name, get_prop_call).decode()
+        query_result = self.query(qube_name, get_prop_call)
         try:
             x = query_result.split(maxsplit=2)
             typeliteral , _, type_ = x[1].partition('=')

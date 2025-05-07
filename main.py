@@ -16,7 +16,7 @@
 # You should have received a copy of the GNU General Public License along with
 # this program. If not, see <https://www.gnu.org/licenses/>.
 
-options = {
+options_defaults = {
     "db_path": "db.json",
     "clients_path": "clients",
     "profiles_subset": None,
@@ -30,10 +30,6 @@ from jinja2 import Template
 from qubesagent.firewall import NftablesWorker
 
 
-
-#
-# CORE FUNCTIONS
-#
 
 def resolve_filepath(path):
     if os.path.isabs(path):
@@ -294,24 +290,21 @@ def render_nft(clients, data):
 
 
 
-#
-# MAIN
-#
-
-# lazy-loading saved states
-@(lambda x: x())
-class state:
+class App:
     def __init__(self):
         self.failstate = "OK"
-    #
+        self.options = options_defaults.copy()
+
+    # lazy-loading saved states
+
     @cached_property
     def db(self):
-        path = resolve_filepath(options['db_path'])
+        path = resolve_filepath(self.options['db_path'])
         return Database(path)
 
     @cached_property
     def clients(self):
-        path = resolve_filepath(options['clients_path'])
+        path = resolve_filepath(self.options['clients_path'])
         return load_clients_config(path)
 
     @cached_property
@@ -321,79 +314,96 @@ class state:
             r |= set(cli.profiles)
         return r
 
+    @property
     def active_subset(self):
-        return options['profiles_subset'] or self.referenced_profiles
+        return self.options['profiles_subset'] or self.referenced_profiles
 
-    def non_failstate_only(self, f):
-        def wrap():
+    # actions
+
+    @cached_property
+    def actions(self):
+        actions_ = {}
+
+        def _name_of(f):
+            return f.__name__.replace('_','-')
+
+        def action(f):
+            actions_[_name_of(f)] = f
+
+        def non_failstate_action(f):
+            def wrap():
+                if self.failstate == 'OK':
+                    f()
+            actions_[_name_of(f)] = wrap
+
+        # action definitions
+
+        @non_failstate_action
+        def read_env():
+            for k,v in os.environ.items():
+                match k:
+                    case "FW_DB_PATH":
+                        self.options['db_path'] = v
+                    case "FW_CLIENTS_PATH":
+                        self.options['clients_path'] = v
+                    case "FW_SUBSET":
+                        self.options['profiles_subset'] = set(v.split(','))
+
+        @non_failstate_action
+        def refresh():
+            self.db.update(force=False, subset=self.active_subset)
+
+        @non_failstate_action
+        def force_refresh():
+            self.db.update(force=True, subset=self.active_subset)
+
+        @non_failstate_action
+        def save():
+            self.db.save(force=False)
+
+        @action
+        def status():
             if self.failstate == 'OK':
-                f()
-        return wrap
+                self.db.print_status(self.options['profiles_subset'])
+            else:
+                print("Can't print database state because previous errors were encountered")
 
-# define main program actions
-@(lambda x: x())
-def actions():
+        @action
+        def render():
+            try:
+                if self.failstate != 'OK':
+                    raise Exception("Rendering in a failed state")
+                render_out = render_nft(self.clients, self.db.data)
+            except:
+                print(NFT_FAILSAFE)
+                raise
+            else:
+                print(render_out)
+
+        @action
+        def s1():
+            time.sleep(1)
+
+        return actions_
+
     #
-    @state.non_failstate_only
-    def read_env():
-        for k,v in os.environ.items():
-            match k:
-                case "FW_DB_PATH":
-                    options['db_path'] = v
-                case "FW_CLIENTS_PATH":
-                    options['clients_path'] = v
-                case "FW_SUBSET":
-                    options['profiles_subset'] = set(v.split(','))
 
-    @state.non_failstate_only
-    def refresh():
-        state.db.update(force=False, subset=state.active_subset())
-
-    @state.non_failstate_only
-    def force_refresh():
-        state.db.update(force=True, subset=state.active_subset())
-
-    @state.non_failstate_only
-    def save():
-        state.db.save(force=False)
-
-    def status():
-        if state.failstate == 'OK':
-            state.db.print_status(options['profiles_subset'])
-        else:
-            print("Can't print database state because previous errors were encountered")
-
-    def render():
+    def main(self):
         try:
-            if state.failstate != 'OK':
-                raise Exception("Rendering in a failed state")
-            render_out = render_nft(state.clients, state.db.data)
-        except:
-            print(NFT_FAILSAFE)
-            raise
-        else:
-            print(render_out)
-
-    def s1():
-        time.sleep(1)
-
-    actions_ = locals().copy()
-    return {k.replace('_','-'): v for k,v in actions_.items()}
-
-# run user-specified action(s) from command-line
-if __name__ == '__main__':
-    for act_name in sys.argv[1:]:
-        try:
-            action = actions[act_name]
-        except KeyError:
-            print("invalid action", action, file=sys.stderr)
+            to_invoke = [self.actions[actname] for actname in sys.argv[1:]]
+        except KeyError as e:
+            print("invalid action", e.args[0], file=sys.stderr)
             sys.exit(1)
-        try:
-            action()
-        except Exception as e:
-            state.failstate = "FAILED"
-            traceback.print_exception(e)
 
-    # bye!
-    exit_codes = {'OK':0, 'FAILED':1}
-    exit(exit_codes[state.failstate])
+        for act in to_invoke:
+            try:
+                act()
+            except Exception as e:
+                self.failstate = "FAILED"
+                traceback.print_exception(e)
+
+        exit_codes = {'OK':0, 'FAILED':1}
+        exit(exit_codes[self.failstate])
+
+if __name__ == '__main__':
+    App().main()
