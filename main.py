@@ -280,6 +280,22 @@ table ip custom-dynamic {
 }
 '''
 
+NFT_IP4_ONLY = '''#!/usr/sbin/nft -f
+
+table inet custom-ip4-only {
+}
+
+flush table inet custom-ip4-only
+
+table inet custom-ip4-only {
+    chain forward {
+        type filter hook forward priority filter - 1; policy drop;
+        meta nfproto ipv4 accept
+    }
+}
+
+'''
+
 def render_nft(clients, data):
     env = {
         'clients': clients,
@@ -375,9 +391,11 @@ class App:
                     raise Exception("Rendering in a failed state")
                 render_out = render_nft(self.clients, self.db.data)
             except:
+                print(NFT_IP4_ONLY)
                 print(NFT_FAILSAFE)
                 raise
             else:
+                print(NFT_IP4_ONLY)
                 print(render_out)
 
         @action
