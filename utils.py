@@ -1,13 +1,14 @@
-import sys, json, time, re, subprocess, functools
+import sys, json, time, re, functools
 from functools import cached_property
 from copy import deepcopy
 from types import SimpleNamespace
+import qubesdb
 
 def unix_minutes():
     return time.time_ns() // (60 * (10**9))
 
 ip4_pattern = re.compile(r"^[1-9][0-9]{0,2}(?:\.(?:0|[1-9][0-9]{0,2})){3}(?:/[1-9][0-9]?)?$")
-def is_ip4(s):
+def is_ip4(s:str):
     if not bool(ip4_pattern.match(s)):
         return False
     [s,*suffix] = s.split('/')
@@ -58,6 +59,10 @@ class qubes:
     def app(self):
         return self.admin.Qubes()
 
+    @cached_property
+    def qdb(self):
+        return qubesdb.QubesDB()
+
     def query(self, qube_name, api_call):
         try:
             query_result = self.app.qubesd_call(qube_name, api_call)
@@ -92,17 +97,15 @@ class qubes:
             case _:
                 raise TypeError(f"property type {type_} not supported here.")
 
-    @staticmethod
-    def dns_addrs():
+    @cached_property
+    def dns_addrs(self):
         r = []
         for key in ("/qubes-primary-dns","/qubes-secondary-dns"):
-            proc = subprocess.run(
-                        ["/usr/bin/qubesdb-read",key],
-                        text=True,
-                        capture_output=True)
-            addr = proc.stdout.strip()
-            if is_ip4(addr):
+            addr = (qubes.qdb.read(key) or b"").decode()
+            if addr:
+                if not is_ip4(addr):
+                    raise ValueError("Not apparently a valid ip address: "+repr(addr))
                 r.append(addr)
         if not r:
-            raise Exception("Couldn't retreive any DNS addresses")
+            raise RuntimeError("Couldn't retreive any DNS addresses")
         return r

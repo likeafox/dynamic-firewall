@@ -17,15 +17,17 @@
 # this program. If not, see <https://www.gnu.org/licenses/>.
 
 options_defaults = {
-    "db_path": "db.json",
+    "workdir_path": "work",
     "clients_path": "clients",
     "profiles_subset": None,
+    "min_wait_sec": 15,
+    "max_wait_sec": (60*60*24),
 }
 
 from utils import *
 from sites import *
 
-import os, os.path, traceback
+import os, os.path, subprocess, traceback, signal, asyncio
 from jinja2 import Template
 from qubesagent.firewall import NftablesWorker
 
@@ -150,6 +152,7 @@ class Database:
 
             obj['nextRefreshMins'] = now + profile['refreshIntervalMins']
             obj['lastRefreshSucceeded'] = True
+            print(f"refreshing {name}: ", end='', file=sys.stderr, flush=True)
             try:
                 result = profile['refresh'](obj['addresses'])
                 if type(result) is list:
@@ -162,7 +165,9 @@ class Database:
                     raise TypeError()
             except Exception as e:
                 obj['lastRefreshSucceeded'] = False
-                print(f"error during {name} refresh: ", str(e), file=sys.stderr)
+                print("FAILED\nerror during refresh:", str(e), file=sys.stderr)
+            else:
+                print("OK", file=sys.stderr)
 
             self.data[name] = obj
 
@@ -211,7 +216,7 @@ table ip custom-dynamic {
     set dns-addrs {
         typeof ip daddr
         elements = {
-            {%- for addr in dns_addrs() %}
+            {%- for addr in dns_addrs %}
             {{ addr }},
             {%- endfor %}
         }
@@ -307,15 +312,28 @@ def render_nft(clients, data):
 
 
 class App:
-    def __init__(self):
-        self.failstate = "OK"
+    USE_ARGV = object()
+    def __init__(self, actions_to_invoke=USE_ARGV):
         self.options = options_defaults.copy()
+        self.actions = self._make_actions()
+        self.runmode = "OK"
+        # validate actions_to_invoke
+        ati = sys.argv[1:] if (actions_to_invoke is self.USE_ARGV) \
+                        else actions_to_invoke
+        if type(ati) is str or not hasattr(ati,"__getitem__"):
+            raise TypeError("type(actions_to_invoke) is "+type(ati))
+        if invalid_acts := [str(a) for a in ati if a not in self.actions]:
+            raise ValueError("invalid action(s): " + ' '.join(invalid_acts))
+        #
+        self.actions_to_invoke = ati
+        self.next_to_invoke = 0
+        self.loop_start = 0
 
     # lazy-loading saved states
 
     @cached_property
     def db(self):
-        path = resolve_filepath(self.options['db_path'])
+        path = os.path.join(resolve_filepath(self.options['workdir_path']), "db.json")
         return Database(path)
 
     @cached_property
@@ -323,105 +341,232 @@ class App:
         path = resolve_filepath(self.options['clients_path'])
         return load_clients_config(path)
 
-    @cached_property
-    def referenced_profiles(self):
-        r = set()
-        for cli in self.clients:
-            r |= set(cli.profiles)
-        return r
-
     @property
     def active_subset(self):
-        return self.options['profiles_subset'] or self.referenced_profiles
+        if (r := self.options['profiles_subset']) is not None:
+            return r
+        else:
+            r = set()
+            for cli in self.clients:
+                r |= set(cli.profiles)
+            return r
 
     # actions
 
-    @cached_property
-    def actions(self):
+    def _make_actions(self):
         actions_ = {}
 
         def _name_of(f):
-            return f.__name__.replace('_','-')
+            return f.__name__.rstrip('_').replace('_','-')
 
         def action(f):
             actions_[_name_of(f)] = f
 
-        def non_failstate_action(f):
-            def wrap():
-                if self.failstate == 'OK':
-                    f()
-            actions_[_name_of(f)] = wrap
+        def xmode_action(*modes):
+            def d(f):
+                def wrap():
+                    if self.runmode in modes:
+                        f()
+                actions_[_name_of(f)] = wrap
+            return d
 
         # action definitions
 
-        @non_failstate_action
+        @action
         def read_env():
             for k,v in os.environ.items():
                 match k:
-                    case "FW_DB_PATH":
-                        self.options['db_path'] = v
+                    case "FW_WORKDIR_PATH":
+                        self.options['workdir_path'] = v
                     case "FW_CLIENTS_PATH":
                         self.options['clients_path'] = v
                     case "FW_SUBSET":
                         self.options['profiles_subset'] = set(v.split(','))
+                    case "FW_MIN_WAIT":
+                        self.options['min_wait_sec'] = int(v)
+                    case "FW_MAX_WAIT":
+                        self.options['max_wait_sec'] = int(v)
 
-        @non_failstate_action
+        @xmode_action('OK')
         def refresh():
             self.db.update(force=False, subset=self.active_subset)
 
-        @non_failstate_action
+        @xmode_action('OK')
         def force_refresh():
             self.db.update(force=True, subset=self.active_subset)
 
-        @non_failstate_action
+        @xmode_action('OK','EXITING')
         def save():
             self.db.save(force=False)
 
         @action
         def status():
-            if self.failstate == 'OK':
+            if self.runmode != 'FAILED':
                 self.db.print_status(self.options['profiles_subset'])
             else:
                 print("Can't print database state because previous errors were encountered")
 
-        @action
-        def render():
+        def _render():
             try:
-                if self.failstate != 'OK':
+                if self.runmode == 'FAILED':
                     raise Exception("Rendering in a failed state")
                 render_out = render_nft(self.clients, self.db.data)
-            except:
-                print(NFT_IP4_ONLY)
-                print(NFT_FAILSAFE)
-                raise
+            except Exception as e:
+                r = NFT_IP4_ONLY + NFT_FAILSAFE
+                return (r, e)
             else:
-                print(NFT_IP4_ONLY)
-                print(render_out)
+                r = NFT_IP4_ONLY + render_out
+                return (r, None)
 
         @action
+        def render_print():
+            render_out, e = _render()
+            print(render_out)
+            if e is not None:
+                raise e
+
+        @action
+        def render_activate():
+            render_out, e = _render()
+            try:
+                workdir_path = resolve_filepath(self.options['workdir_path'])
+                render_path = os.path.join(workdir_path, "out.nft")
+                with open(render_path, 'w') as f:
+                    f.write(render_out)
+                os.chmod(render_path, 0o744)
+                subprocess.run(render_path, check=True)
+                print("nft activated", file=sys.stderr)
+            finally:
+                if e is not None:
+                    raise e
+
+        @xmode_action('OK')
+        def wait():
+            try:
+                asyncio.run(self.do_wait())
+            finally:
+                if 'clients' in self.__dict__:
+                    del self.__dict__['clients']
+
+        @xmode_action('OK')
         def s1():
             time.sleep(1)
 
+        @xmode_action('OK')
+        def loop():
+            self.next_to_invoke = self.loop_start
+
+        @xmode_action('OK')
+        def do_():
+            self.loop_start = self.next_to_invoke
+
+        @action
+        def hi():
+            msg = ["hi","bye"][int(self.runmode == 'EXITING')]
+            print(msg)
+            time.sleep(0.05)
+
         return actions_
+
+    async def do_wait(self):
+        '''doing nothing is complicated'''
+        start_time = time.time()
+        loop = asyncio.get_running_loop()
+        async def min_wait():
+            elapsed = time.time() - start_time
+            await asyncio.sleep(self.options['min_wait_sec'] - elapsed)
+
+        # task 1/3
+        @(lambda f: asyncio.create_task(f()))
+        async def firewall_update_waiting():
+            @(lambda f: asyncio.create_task(f()))
+            async def forever_task():
+                while True:
+                    await asyncio.sleep(55555)
+            assert "SelectorEventLoop" in asyncio.__dict__
+            assert isinstance(loop, asyncio.SelectorEventLoop)
+            qdb = qubesdb.QubesDB()
+            qdb.watch("/qubes-firewall/")
+            qdb_watch_fd = qdb.watch_fd()
+            def cb():
+                loop.remove_reader(qdb_watch_fd)
+                forever_task.cancel()
+            loop.add_reader(qdb_watch_fd, cb)
+            await forever_task
+            await asyncio.sleep(0.5)
+        for _ in range(2):
+            await asyncio.sleep(0) #let firewall watcher get a head-start
+
+        # task 2/3
+        @(lambda f: asyncio.create_task(f()))
+        async def clients_file_waiting():
+            path = resolve_filepath(self.options['clients_path'])
+            #await min_wait()
+            while True:
+                info = os.stat(path)
+                if info.st_mtime > start_time:
+                    return
+                await asyncio.sleep(25)
+
+        # task 3/3
+        def determinate_secs():
+            min_ = self.options['max_wait_sec']
+            for prof in self.active_subset:
+                if prof in self.db.data:
+                    cur = self.db.data[prof]['nextRefreshMins'] * 60 + 59 - start_time
+                    min_ = min(min_, cur)
+                else:
+                    return 0
+            return max(min_, 0)
+        determinate_waiting = \
+            asyncio.create_task(asyncio.sleep(determinate_secs()))
+
+        # now we play the waiting game
+        tasks = (firewall_update_waiting, clients_file_waiting, determinate_waiting)
+        hehe = asyncio.create_task(min_wait())
+        waiting = asyncio.gather(
+            hehe,
+            asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        )
+
+        handled_signals = (signal.SIGINT, signal.SIGTERM)
+        for sig in handled_signals:
+            def get_interrupted(*_):
+                print(f"signal {sig} received. exiting soon.", file=sys.stderr)
+                if self.runmode == 'OK':
+                    self.runmode = "EXITING"
+                waiting.cancel()
+                hehe.cancel()
+            loop.add_signal_handler(sig, get_interrupted)
+
+        try:
+            _,(done,pending) = await waiting
+            for t in pending:
+                t.cancel()
+            await asyncio.wait(pending)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            for sig in handled_signals:
+                loop.remove_signal_handler(sig)
 
     #
 
-    def main(self):
-        try:
-            to_invoke = [self.actions[actname] for actname in sys.argv[1:]]
-        except KeyError as e:
-            print("invalid action", e.args[0], file=sys.stderr)
-            sys.exit(1)
+    def run(self):
+        while True:
+            try:
+                act = self.actions[self.actions_to_invoke[self.next_to_invoke]]
+            except IndexError:
+                break
+            self.next_to_invoke += 1
 
-        for act in to_invoke:
             try:
                 act()
             except Exception as e:
-                self.failstate = "FAILED"
+                self.runmode = "FAILED"
                 traceback.print_exception(e)
 
-        exit_codes = {'OK':0, 'FAILED':1}
-        exit(exit_codes[self.failstate])
+        exit(bool(self.runmode == 'FAILED'))
 
 if __name__ == '__main__':
-    App().main()
+    App().run()
