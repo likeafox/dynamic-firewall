@@ -461,6 +461,10 @@ class App:
             self.loop_start = self.next_to_invoke
 
         @action
+        def fail():
+            self.runmode = "FAILED"
+
+        @action
         def hi():
             msg = ["hi","bye"][int(self.runmode == 'EXITING')]
             print(msg)
