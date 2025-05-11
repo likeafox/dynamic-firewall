@@ -195,7 +195,7 @@ class Database:
             addr_ranges = []
             for addr in obj['addresses']:
                 range_ = cidr4_to_intrange(addr)
-                range_diff(addr_ranges, range_)
+                addr_ranges = list(range_diff(addr_ranges, range_))
                 addr_ranges.append(range_)
             ip_count = sum(len(r) for r in addr_ranges)
 
