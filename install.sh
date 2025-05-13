@@ -1,21 +1,46 @@
 #!/usr/bin/bash
 
 test `whoami` = root || {
-    echo "run install script as root" >&2
-    exit 1
+  echo "run install script as root" >&2
+  exit 1
 }
 
 set -e
 
 SCRIPT_DIR=$(realpath `dirname "${BASH_SOURCE[0]}"`)
+FAILSAFE_PATH="$SCRIPT_DIR"/work/failsafe.nft
+QFW_FAILSAFE_PATH="/rw/config/qubes-firewall.d/01-dynamic-firewall-failsafe.nft"
 
 cd "$SCRIPT_DIR"
+python3 << __EOF__
+import importlib, sys
+exitcode = 0
+
+required_modules = [
+  "requests",
+  "jinja2",
+  "qubesagent",
+  "qubesdb",
+  "qubesadmin",
+]
+
+for m in required_modules:
+  if importlib.util.find_spec(m) is None:
+    print("missing module:", m, file=sys.stderr)
+    exitcode = 1
+sys.exit(exitcode)
+__EOF__
+
 touch clients
 mkdir -p work
-python3 "$SCRIPT_DIR"/main.py fail render-print >"$SCRIPT_DIR"/work/failsafe.nft 2>/dev/null || :
-mkdir -p /rw/config/qubes-firewall.d
-cp "$SCRIPT_DIR"/work/failsafe.nft /rw/config/qubes-firewall.d/01-dynamic-firewall-failsafe.nft
-chmod +x /rw/config/qubes-firewall.d/01-dynamic-firewall-failsafe.nft
+python3 "$SCRIPT_DIR"/main.py fail render-print >"$FAILSAFE_PATH" 2>/dev/null || :
+grep -q -e "table ip custom-dynamic" "$FAILSAFE_PATH" || {
+  echo "failed to generate fail-safe nft." >&2
+  exit 1
+}
+chmod +x "$FAILSAFE_PATH"
+mkdir -p `dirname "$QFW_FAILSAFE_PATH"`
+ln -sfn "$FAILSAFE_PATH" "$QFW_FAILSAFE_PATH"
 
 cat > /etc/systemd/system/dynamic-firewall-init.service << __EOF__
 [Unit]
@@ -26,7 +51,7 @@ After=qubes-iptables.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/nft -f "$SCRIPT_DIR"/work/failsafe.nft
+ExecStart=/usr/sbin/nft -f "$FAILSAFE_PATH"
 
 [Install]
 WantedBy=multi-user.target
